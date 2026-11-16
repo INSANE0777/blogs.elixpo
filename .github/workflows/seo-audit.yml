@@ -1,0 +1,71 @@
+# Daily technical audit of the deployed article-only sitemap.
+# Prepared for review only: see docs/seo-audit.md for the activation prerequisites.
+# Merge this file only after the feed and indexing policy are deployed and verified.
+name: SEO audit
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seo-audit-production
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Audit production article sitemap
+    if: >-
+      github.repository == 'elixpo/blogs.elixpo' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run the technical audit
+        run: |
+          mkdir -p seo-audit-reports
+          node scripts/audit-seo.mjs \
+            --sitemap https://blogs.elixpo.com/blog-sitemap.xml \
+            --limit 25 \
+            --json seo-audit-reports/report.json \
+            --markdown seo-audit-reports/report.md
+
+      - name: Summarize the audit
+        if: always()
+        run: |
+          {
+            echo "## SEO audit"
+            echo
+            if [ -f seo-audit-reports/report.md ]; then
+              cat seo-audit-reports/report.md
+            else
+              echo "No audit report was produced. The run did not reach report writing (install, configuration or CLI failure); this is not a technical pass."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: seo-audit-report
+          path: |
+            seo-audit-reports/report.json
+            seo-audit-reports/report.md
+          retention-days: 14
+          if-no-files-found: warn
