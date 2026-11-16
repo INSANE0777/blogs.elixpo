@@ -1,6 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { auditSitemap, AuditConfigError } from './seo/audit.mjs';
+import { inspectSample } from './seo/inspection.mjs';
 import { renderJson, renderMarkdown } from './seo/report.mjs';
 
 const USAGE = `Usage: node scripts/audit-seo.mjs --sitemap <url> [options]
@@ -8,24 +9,34 @@ const USAGE = `Usage: node scripts/audit-seo.mjs --sitemap <url> [options]
 Options:
   --sitemap <url>    Explicit article sitemap URL (HTTPS; loopback HTTP for local fixtures).
   --limit <1..100>   Sample size (default 25, maximum 100).
+  --inspect          Also run read-only Google URL Inspection. Requires
+                     SEO_SEARCH_CONSOLE_CREDENTIALS (service-account JSON) and
+                     SEO_SEARCH_CONSOLE_PROPERTY. A missing credential skips;
+                     invalid configured values return exit 2.
   --json <path>      Write the structured report to a file.
   --markdown <path>  Write the Markdown report to a file.
   --help             Show this help without making a request.
 
 The sitemap must contain article URLs only. This audit samples the first unique URLs
 in producer order; it is not an exhaustive crawl. Exit codes: 0 clean, 1 technical
-failure, 2 invalid configuration. Google indexing is not checked.`;
+failure, 2 invalid configuration. Google inspection is separate from technical status.`;
 
 const VALUE_FLAGS = new Set(['--sitemap', '--limit', '--json', '--markdown']);
 
 export function parseArgs(argv) {
   if (argv.includes('--help')) {
-    return { help: true, sitemap: null, limit: undefined, json: null, markdown: null };
+    return { help: true, sitemap: null, limit: undefined, json: null, markdown: null, inspect: false };
   }
-  const options = { help: false, sitemap: null, limit: undefined, json: null, markdown: null };
+  const options = { help: false, sitemap: null, limit: undefined, json: null, markdown: null, inspect: false };
   const seen = new Set();
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
+    if (flag === '--inspect') {
+      if (seen.has(flag)) throw new Error('An option was repeated.');
+      seen.add(flag);
+      options.inspect = true;
+      continue;
+    }
     if (!VALUE_FLAGS.has(flag)) throw new Error('Unknown or positional argument.');
     if (seen.has(flag)) throw new Error('An option was repeated.');
     seen.add(flag);
@@ -51,16 +62,19 @@ export function parseArgs(argv) {
   return options;
 }
 
-export async function main(argv, io = { stdout: process.stdout, stderr: process.stderr }) {
+export async function main(argv, io = {}) {
+  const stdout = io.stdout ?? process.stdout;
+  const stderr = io.stderr ?? process.stderr;
+  const env = io.env ?? process.env;
   let options;
   try {
     options = parseArgs(argv);
   } catch (error) {
-    io.stderr.write(`${error.message}\n`);
+    stderr.write(`${error.message}\n`);
     return 2;
   }
   if (options.help) {
-    io.stdout.write(`${USAGE}\n`);
+    stdout.write(`${USAGE}\n`);
     return 0;
   }
 
@@ -69,22 +83,39 @@ export async function main(argv, io = { stdout: process.stdout, stderr: process.
     report = await auditSitemap({ sitemapUrl: options.sitemap, limit: options.limit });
   } catch (error) {
     if (error instanceof AuditConfigError) {
-      io.stderr.write(`${error.message}\n`);
+      stderr.write(`${error.message}\n`);
       return 2;
     }
-    io.stderr.write('The audit could not run.\n');
+    stderr.write('The audit could not run.\n');
     return 1;
   }
 
+  try {
+    report.inspection = await inspectSample({
+      urls: report.sampledUrls,
+      requested: options.inspect,
+      env,
+      ...(io.inspectionAdapters ?? {}),
+    });
+  } catch {
+    report.inspection = {
+      status: 'unavailable',
+      code: 'INSPECTION_FAILED',
+      reason: 'Optional Google inspection could not finish.',
+      results: [],
+    };
+  }
+
   const markdown = renderMarkdown(report);
-  io.stdout.write(markdown);
+  stdout.write(markdown);
   try {
     if (options.json) await writeFile(options.json, renderJson(report));
     if (options.markdown) await writeFile(options.markdown, markdown);
   } catch {
-    io.stderr.write('Could not write an output file.\n');
+    stderr.write('Could not write an output file.\n');
     return 1;
   }
+  if (report.inspection.status === 'invalid-configuration') return 2;
   return report.technicalStatus === 'passed' ? 0 : 1;
 }
 

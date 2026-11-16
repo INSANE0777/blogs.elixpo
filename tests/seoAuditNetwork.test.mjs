@@ -128,7 +128,7 @@ test('fetches the sitemap, robots and each sampled article with a safe request i
     selection: 'first-unique-in-producer-order',
     results: urls.map((url) => ({ url, issues: [] })),
     issues: [],
-    inspection: { status: 'skipped', reason: 'not part of this package' },
+    inspection: { status: 'skipped', reason: 'inspection not requested' },
   });
 });
 

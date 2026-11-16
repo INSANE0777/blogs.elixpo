@@ -102,6 +102,7 @@ test('parses supported options and applies the documented defaults', () => {
       limit: 7,
       json: 'report.json',
       markdown: 'report.md',
+      inspect: false,
     },
   );
   assert.deepEqual(parseArgs(['--sitemap', 'https://example.com/blog-sitemap.xml']), {
@@ -110,6 +111,7 @@ test('parses supported options and applies the documented defaults', () => {
     limit: undefined,
     json: null,
     markdown: null,
+    inspect: false,
   });
 });
 
@@ -152,7 +154,7 @@ test('renders a bounded, escaped markdown report', () => {
       },
     ],
     issues: [],
-    inspection: { status: 'skipped', reason: 'not part of this package' },
+    inspection: { status: 'skipped', reason: 'inspection not requested' },
   };
   const markdown = renderMarkdown(report);
   assert.ok(markdown.includes('**failed**'));
@@ -181,7 +183,7 @@ test('renders JSON that round-trips', () => {
     selection: 'first-unique-in-producer-order',
     results: [],
     issues: [],
-    inspection: { status: 'skipped', reason: 'not part of this package' },
+    inspection: { status: 'skipped', reason: 'inspection not requested' },
   };
   assert.deepEqual(JSON.parse(renderJson(report)), report);
 });
@@ -266,7 +268,7 @@ test('runs end-to-end against a loopback fixture server', async (t) => {
   assert.equal(report.duplicateCount, 0);
   assert.equal(report.selection, 'first-unique-in-producer-order');
   assert.deepEqual(report.issues, []);
-  assert.deepEqual(report.inspection, { status: 'skipped', reason: 'not part of this package' });
+  assert.deepEqual(report.inspection, { status: 'skipped', reason: 'inspection not requested' });
   assert.deepEqual(report.results[0], { url: healthy, issues: [] });
   assert.deepEqual(
     report.results[1].issues.map((issue) => issue.code),

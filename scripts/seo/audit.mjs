@@ -202,7 +202,7 @@ export async function auditSitemap({
     selection: 'first-unique-in-producer-order',
     results: [],
     issues: [],
-    inspection: { status: 'skipped', reason: 'not part of this package' },
+    inspection: { status: 'skipped', reason: 'inspection not requested' },
   };
 
   let sitemapText;
