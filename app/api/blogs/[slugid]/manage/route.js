@@ -5,8 +5,7 @@ import { NextResponse } from 'next/server';
 import { getSession } from '../../../../../lib/auth';
 import { getDB } from '../../../../../lib/cloudflare';
 import { invalidateBlogLifecycleCaches } from '../../../../../lib/api/v1/blogCache';
-import { getBlogCanonicalPath } from '../../../../../lib/blogUrl';
-import { notifySearchDiscovery } from '../../../../../lib/searchDiscovery';
+import { getIndexableBlogUrl, notifyBlogDiscoveryChange } from '../../../../../lib/blogDiscovery';
 
 const ACTION_STATUS = { unlist: 'unlisted', archive: 'archived' };
 
@@ -25,10 +24,10 @@ export async function PATCH(request, { params }) {
     if (blog.author_id !== session.userId) {
       return NextResponse.json({ error: 'Only the blog owner can change its publication state' }, { status: 403 });
     }
-    const publicUrl = `https://blogs.elixpo.com${await getBlogCanonicalPath(db, slugid)}`;
+    const beforeUrl = await getIndexableBlogUrl(db, slugid);
     await db.prepare('UPDATE blogs SET status = ?, updated_at = unixepoch() WHERE id = ?').bind(status, slugid).run();
     await invalidateBlogLifecycleCaches(slugid);
-    notifySearchDiscovery(publicUrl);
+    notifyBlogDiscoveryChange(beforeUrl, await getIndexableBlogUrl(db, slugid));
     return NextResponse.json({ ok: true, id: slugid, status });
   } catch (error) {
     console.error('[blogs/manage] update failed:', error?.message || error);

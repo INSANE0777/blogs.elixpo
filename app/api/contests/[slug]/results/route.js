@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic';
 import { NextResponse } from 'next/server';
 import { getSession } from '../../../../../lib/auth';
 import { getDB } from '../../../../../lib/cloudflare';
+import { invalidateSitemapCache } from '../../../../../lib/cache';
 import {
   CONTEST_PLACEMENTS,
   canJudgeContest,
@@ -47,6 +48,7 @@ export async function POST(request, { params }) {
     }
     if (input.finalize) statements.push(db.prepare("UPDATE contests SET status = 'completed', results_at = unixepoch(), updated_at = unixepoch() WHERE id = ?").bind(contest.id));
     await db.batch(statements);
+    if (input.finalize) await invalidateSitemapCache();
     await recordContestAudit(db, { contestId: contest.id, actorId: session.userId, action: input.finalize ? 'results.finalized' : 'results.updated', metadata: { awards: awards.length } });
     if (input.finalize) {
       const recipients = await db.prepare('SELECT DISTINCT author_id FROM contest_submissions WHERE contest_id = ? AND withdrawn_at IS NULL').bind(contest.id).all();

@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic';
 import { authorizeApiRequest } from '../../../../../../lib/api/v1/authorize';
 import { recordApiAudit } from '../../../../../../lib/api/v1/operations';
 import { apiError, apiSuccess, requestContext } from '../../../../../../lib/api/v1/responses';
+import { invalidateSitemapCache } from '../../../../../../lib/cache';
 import { CONTEST_PLACEMENTS, canJudgeContest, contestRole, contestState, getContest, recordContestAudit } from '../../../../../../lib/contests';
 
 export async function POST(request, { params }) {
@@ -27,6 +28,7 @@ export async function POST(request, { params }) {
     for (const award of awards) { const position = (counts.get(award.placement) || 0) + 1; counts.set(award.placement, position); statements.push(db.prepare('INSERT INTO contest_awards (contest_id, submission_id, placement, position, awarded_by, awarded_at) VALUES (?, ?, ?, ?, ?, unixepoch())').bind(contest.id, award.submissionId, award.placement, position, auth.userId)); }
     if (input.finalize) statements.push(db.prepare("UPDATE contests SET status = 'completed', results_at = unixepoch(), updated_at = unixepoch() WHERE id = ?").bind(contest.id));
     await db.batch(statements);
+    if (input.finalize) await invalidateSitemapCache();
     await recordContestAudit(db, { contestId: contest.id, actorId: auth.userId, action: input.finalize ? 'results.finalized' : 'results.updated' });
     await recordApiAudit(db, { requestId: context.requestId, userId: auth.userId, clientId: auth.clientId, action: 'contests.results.update', resourceType: 'contest', resourceId: contest.id });
     return apiSuccess(context, { updated: true, finalized: Boolean(input.finalize) }, { headers: rateHeaders });

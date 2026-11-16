@@ -6,6 +6,7 @@ import { readTimeFromWords } from '../../../../lib/readTime';
 import { BLOG_LICENSES } from '../../../../lib/curatedCollections';
 import { contentDiscoveryMetadata } from '../../../../lib/recommendations';
 import { countBlockWords } from '../../../../lib/api/v1/blogInput';
+import { getIndexableBlogUrl, notifyBlogDiscoveryChange } from '../../../../lib/blogDiscovery';
 
 export async function POST(request) {
   const session = await getSession();
@@ -74,6 +75,7 @@ export async function POST(request) {
     const normalizedTags = Array.isArray(tags) ? normalizeTags(tags) : null;
 
     const existing = await db.prepare('SELECT id, author_id, status, published_as, slug, secret, member_only, license, language, region FROM blogs WHERE id = ?').bind(slugid).first();
+    const beforeUrl = await getIndexableBlogUrl(db, slugid);
     const profile = await db.prepare('SELECT locale FROM users WHERE id = ?').bind(existing?.author_id || session.userId).first();
     const discovery = contentDiscoveryMetadata({
       language: language ?? existing?.language,
@@ -254,6 +256,13 @@ export async function POST(request) {
       await db.batch(statements);
     }
 
+    // The article and tags are committed; later media/response work may fail.
+    try {
+      const { invalidateBlogLifecycleCaches } = await import('../../../../lib/api/v1/blogCache');
+      await invalidateBlogLifecycleCaches(slugid);
+    } catch {}
+    notifyBlogDiscoveryChange(beforeUrl, await getIndexableBlogUrl(db, slugid));
+
     // A user may upload media before the first draft/publish request creates
     // the blog row. Attach those staged records once the FK target exists.
     await db.prepare(`
@@ -266,15 +275,10 @@ export async function POST(request) {
       try { const { snapshotVersion } = await import('../../../../lib/blogVersions'); await snapshotVersion(db, slugid, compressedContent, { label: 'published', userId: session.userId }); } catch {}
     }
 
-    // Refresh both reader-facing discovery caches and the sitemap. This runs for
-    // publish, update, unlist, and draft transitions handled by this endpoint.
+    // Media inventory is refreshed after its association write.
     try {
-      const { invalidateBlogLifecycleCaches } = await import('../../../../lib/api/v1/blogCache');
       const { kvInvalidate, mediaInventoryCacheKey } = await import('../../../../lib/cache');
-      await Promise.all([
-        invalidateBlogLifecycleCaches(slugid),
-        kvInvalidate(mediaInventoryCacheKey(session.userId)),
-      ]);
+      await kvInvalidate(mediaInventoryCacheKey(session.userId));
     } catch {}
 
     // Canonical, scope-aware reader URL (personal / org / collection) keyed off
@@ -286,11 +290,6 @@ export async function POST(request) {
       url = await getBlogCanonicalPath(db, slugid);
     } catch {
       url = `/${session.profile?.username || 'user'}/${slug}`;
-    }
-
-    if (targetStatus === 'published' || existing?.status === 'published') {
-      const { notifySearchDiscovery } = await import('../../../../lib/searchDiscovery');
-      notifySearchDiscovery(`https://blogs.elixpo.com${url}`);
     }
 
     // Collaboration invitations become actionable only when their reader URL

@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic';
 import { NextResponse } from 'next/server';
 import { getSession } from '../../../../lib/auth';
 import { getDB } from '../../../../lib/cloudflare';
+import { invalidateSitemapCache } from '../../../../lib/cache';
 import {
   canManageContest,
   contestCoverUrl,
@@ -73,12 +74,14 @@ export async function PATCH(request, { params }) {
         if (!contest.problem_statement || !contest.rules) return NextResponse.json({ error: 'Problem statement and rules are required before publishing' }, { status: 400 });
         if (!['draft', 'scheduled'].includes(contest.status)) return NextResponse.json({ error: 'Contest cannot be published from its current state' }, { status: 409 });
         await db.prepare("UPDATE contests SET status = 'scheduled', published_at = COALESCE(published_at, unixepoch()), updated_at = unixepoch() WHERE id = ?").bind(contest.id).run();
+        await invalidateSitemapCache();
         await recordContestAudit(db, { contestId: contest.id, actorId: session.userId, action: 'contest.published' });
         return NextResponse.json({ ok: true, status: 'scheduled' });
       }
       if (input.action === 'cancel') {
         if (contest.status === 'completed') return NextResponse.json({ error: 'A completed contest cannot be cancelled' }, { status: 409 });
         await db.prepare("UPDATE contests SET status = 'cancelled', updated_at = unixepoch() WHERE id = ?").bind(contest.id).run();
+        await invalidateSitemapCache();
         await recordContestAudit(db, { contestId: contest.id, actorId: session.userId, action: 'contest.cancelled' });
         return NextResponse.json({ ok: true, status: 'cancelled' });
       }
@@ -141,6 +144,9 @@ export async function PATCH(request, { params }) {
     }
     if (!changes.length) return NextResponse.json({ error: 'No changes supplied' }, { status: 400 });
     await db.prepare(`UPDATE contests SET ${changes.join(', ')}, updated_at = unixepoch() WHERE id = ?`).bind(...values, contest.id).run();
+    // A draft contest is absent from the sitemap; every public edit moves its
+    // lastmod or status-derived freshness.
+    if (contest.status !== 'draft') await invalidateSitemapCache();
     await recordContestAudit(db, { contestId: contest.id, actorId: session.userId, action: 'contest.updated', metadata: { fields: [...editable.keys()].filter((key) => input[key] !== undefined) } });
     return NextResponse.json({ ok: true, slug: resultingSlug });
   } catch (error) {

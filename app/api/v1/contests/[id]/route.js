@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic';
 import { authorizeApiRequest } from '../../../../../lib/api/v1/authorize';
 import { recordApiAudit } from '../../../../../lib/api/v1/operations';
 import { apiError, apiSuccess, requestContext } from '../../../../../lib/api/v1/responses';
+import { invalidateSitemapCache } from '../../../../../lib/cache';
 import {
   canManageContest, contestCoverUrl, contestRole, contestSlug, getContest,
   normalizeContestEligibility, normalizeStringArray, parseJson, recordContestAudit, serializeContest,
@@ -45,10 +46,12 @@ export async function PATCH(request, { params }) {
       if (!contest.problem_statement || !contest.rules) return apiError(context, 'contest_incomplete', 'Problem statement and rules are required.', 400, { headers: rateHeaders });
       if (contest.status !== 'draft') return apiError(context, 'invalid_transition', 'Only a draft contest can be published.', 409, { headers: rateHeaders });
       await db.prepare("UPDATE contests SET status = 'scheduled', published_at = COALESCE(published_at, unixepoch()), updated_at = unixepoch() WHERE id = ? AND status = 'draft'").bind(contest.id).run();
+      await invalidateSitemapCache();
       await recordContestAudit(db, { contestId: contest.id, actorId: auth.userId, action: 'contest.published' });
     } else if (input.action === 'cancel') {
       if (contest.status === 'completed') return apiError(context, 'invalid_transition', 'A completed contest cannot be cancelled.', 409, { headers: rateHeaders });
       await db.prepare("UPDATE contests SET status = 'cancelled', updated_at = unixepoch() WHERE id = ?").bind(contest.id).run();
+      await invalidateSitemapCache();
       await recordContestAudit(db, { contestId: contest.id, actorId: auth.userId, action: 'contest.cancelled' });
     } else {
       const columns = { title: ['title', 160], description: ['description', 1000], problemStatement: ['problem_statement', 10000], rules: ['rules', 20000], theme: ['theme', 500], templateContent: ['template_content', 50000] };
@@ -99,6 +102,7 @@ export async function PATCH(request, { params }) {
       }
       if (!changes.length) return apiError(context, 'no_changes', 'No supported changes were supplied.', 400, { headers: rateHeaders });
       await db.prepare(`UPDATE contests SET ${changes.join(', ')}, updated_at = unixepoch() WHERE id = ?`).bind(...values, contest.id).run();
+      if (contest.status !== 'draft') await invalidateSitemapCache();
       await recordContestAudit(db, { contestId: contest.id, actorId: auth.userId, action: 'contest.updated' });
       contest.slug = resultingSlug;
     }

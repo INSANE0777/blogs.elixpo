@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic';
 import { authorizeApiRequest } from '../../../../../lib/api/v1/authorize';
 import { recordApiAudit } from '../../../../../lib/api/v1/operations';
 import { apiError, apiSuccess, requestContext } from '../../../../../lib/api/v1/responses';
+import { invalidateSitemapCache } from '../../../../../lib/cache';
 import { COLLECTION_VISIBILITIES, curatedCoverUrl, getOwnedCollection, serializeCuratedCollection } from '../../../../../lib/curatedCollections';
 
 export async function GET(request, { params }) {
@@ -35,7 +36,7 @@ export async function PATCH(request, { params }) {
   try {
     const collection = await getOwnedCollection(db, id, auth.userId);
     if (!collection) return apiError(context, 'collection_not_found', 'The collection was not found.', 404, { headers: rateHeaders });
-    await db.prepare(`
+    const write = await db.prepare(`
       UPDATE bookmark_collections SET
         name = ?, description = ?, introduction = ?, cover_url = ?, visibility = ?,
         is_public = ?, updated_at = unixepoch()
@@ -49,6 +50,7 @@ export async function PATCH(request, { params }) {
       (input.visibility || collection.visibility) === 'public' ? 1 : 0,
       id, auth.userId,
     ).run();
+    if (write?.meta?.changes) await invalidateSitemapCache();
     await recordApiAudit(db, { requestId: context.requestId, userId: auth.userId, clientId: auth.clientId, action: 'collections.update', resourceType: 'collection', resourceId: id });
     const updated = await getOwnedCollection(db, id, auth.userId);
     return apiSuccess(context, serializeCuratedCollection(updated), { headers: rateHeaders });
@@ -66,6 +68,7 @@ export async function DELETE(request, { params }) {
   try {
     const result = await db.prepare('DELETE FROM bookmark_collections WHERE id = ? AND user_id = ?').bind(id, auth.userId).run();
     if (!result?.meta?.changes) return apiError(context, 'collection_not_found', 'The collection was not found.', 404, { headers: rateHeaders });
+    await invalidateSitemapCache();
     await recordApiAudit(db, { requestId: context.requestId, userId: auth.userId, clientId: auth.clientId, action: 'collections.delete', resourceType: 'collection', resourceId: id });
     return apiSuccess(context, { deleted: true, id }, { headers: rateHeaders });
   } catch {

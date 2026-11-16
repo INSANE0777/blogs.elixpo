@@ -1,6 +1,7 @@
 export const runtime = 'edge';
 import { NextResponse } from 'next/server';
 import { getSession } from '../../../../lib/auth';
+import { getIndexableBlogUrl, notifyBlogDiscoveryChange } from '../../../../lib/blogDiscovery';
 
 // DELETE /api/blogs/[slugid] — permanently delete a blog (primary author only).
 // Hard delete: cascades tags/comments/likes/claps/bookmarks/views/read_history/
@@ -19,11 +20,7 @@ export async function DELETE(request, { params }) {
     if (blog.author_id !== session.userId) {
       return NextResponse.json({ error: 'Only the author can delete this blog' }, { status: 403 });
     }
-    let publicUrl = null;
-    if (blog.status === 'published') {
-      const { getBlogCanonicalPath } = await import('../../../../lib/blogUrl');
-      publicUrl = `https://blogs.elixpo.com${await getBlogCanonicalPath(db, slugid)}`;
-    }
+    const beforeUrl = await getIndexableBlogUrl(db, slugid);
 
     // Best-effort Cloudinary cleanup before the rows vanish.
     let mediaOwners = [];
@@ -59,10 +56,7 @@ export async function DELETE(request, { params }) {
       const { invalidateBlogLifecycleCaches } = await import('../../../../lib/api/v1/blogCache');
       await invalidateBlogLifecycleCaches(slugid);
     } catch {}
-    if (publicUrl) {
-      const { notifySearchDiscovery } = await import('../../../../lib/searchDiscovery');
-      notifySearchDiscovery(publicUrl);
-    }
+    notifyBlogDiscoveryChange(beforeUrl, null);
 
     return NextResponse.json({ ok: true, deleted: true });
   } catch (e) {

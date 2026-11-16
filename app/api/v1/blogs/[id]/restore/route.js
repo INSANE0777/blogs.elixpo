@@ -8,8 +8,7 @@ import { recordApiAudit } from '../../../../../../lib/api/v1/operations';
 import { checkIfMatch } from '../../../../../../lib/api/v1/preconditions';
 import { apiError, apiSuccess, requestContext } from '../../../../../../lib/api/v1/responses';
 import { invalidateBlogLifecycleCaches } from '../../../../../../lib/api/v1/blogCache';
-import { getBlogCanonicalPath } from '../../../../../../lib/blogUrl';
-import { notifySearchDiscovery } from '../../../../../../lib/searchDiscovery';
+import { getIndexableBlogUrl, notifyBlogDiscoveryChange } from '../../../../../../lib/blogDiscovery';
 
 const RESTORABLE = new Set(['draft', 'published', 'unlisted']);
 
@@ -31,16 +30,15 @@ export async function POST(request, { params }) {
       });
     }
     const status = RESTORABLE.has(blog.pre_delete_status) ? blog.pre_delete_status : 'draft';
+    const beforeUrl = await getIndexableBlogUrl(db, id);
     const now = Math.floor(Date.now() / 1000);
     await db.prepare(`
       UPDATE blogs SET status = ?, deleted_at = NULL, pre_delete_status = NULL, updated_at = ? WHERE id = ?
     `).bind(status, now, id).run();
+    if (status !== 'draft') await invalidateBlogLifecycleCaches(id);
+    notifyBlogDiscoveryChange(beforeUrl, await getIndexableBlogUrl(db, id));
     const updated = await db.prepare('SELECT * FROM blogs WHERE id = ?').bind(id).first();
     const etag = await blogEntityTag(updated);
-    if (status !== 'draft') await invalidateBlogLifecycleCaches(id);
-    if (status === 'published') {
-      notifySearchDiscovery(`https://blogs.elixpo.com${await getBlogCanonicalPath(db, id)}`);
-    }
     await recordApiAudit(db, {
       requestId: context.requestId, userId: auth.userId, clientId: auth.clientId,
       action: 'blogs.restore', resourceType: 'blog', resourceId: id,

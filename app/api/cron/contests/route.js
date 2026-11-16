@@ -3,6 +3,7 @@ export const dynamic = 'force-dynamic';
 
 import { NextResponse } from 'next/server';
 import { getDB } from '../../../../lib/cloudflare';
+import { invalidateSitemapCache } from '../../../../lib/cache';
 import { notifyMany } from '../../../../lib/notify';
 import { recordContestAudit } from '../../../../lib/contests';
 
@@ -20,10 +21,12 @@ export async function GET(request) {
   if (!secret || request.headers.get('Authorization') !== `Bearer ${secret}`) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   const db = getDB(), now = Math.floor(Date.now() / 1000), day = 86400;
   const changed = { opened: 0, reminders: 0, judging: 0 };
+  let sitemapTouched = false;
   try {
     const scheduled = await db.prepare("SELECT * FROM contests WHERE status = 'scheduled' AND starts_at <= ?").bind(now).all();
     for (const contest of scheduled?.results || []) {
       await db.prepare("UPDATE contests SET status = 'live', updated_at = unixepoch() WHERE id = ? AND status = 'scheduled'").bind(contest.id).run();
+      sitemapTouched = true;
       await recordContestAudit(db, { contestId: contest.id, actorId: contest.organizer_id, action: 'contest.opened', metadata: { automated: true } });
       await notifyMany(db, await recipients(db, contest.id), { type: 'contest_opened', targetId: contest.id, targetTitle: contest.title, targetUrl: `/contests/${contest.slug}`, dedupe: true });
       changed.opened++;
@@ -41,6 +44,7 @@ export async function GET(request) {
     const ended = await db.prepare("SELECT * FROM contests WHERE status IN ('scheduled', 'live') AND submissions_close_at <= ?").bind(now).all();
     for (const contest of ended?.results || []) {
       await db.prepare("UPDATE contests SET status = 'judging', updated_at = unixepoch() WHERE id = ? AND status IN ('scheduled', 'live')").bind(contest.id).run();
+      sitemapTouched = true;
       await recordContestAudit(db, { contestId: contest.id, actorId: contest.organizer_id, action: 'contest.judging.started', metadata: { automated: true } });
       await notifyMany(db, await recipients(db, contest.id, { includeAuthors: true }), { type: 'contest_judging', targetId: contest.id, targetTitle: contest.title, targetUrl: `/contests/${contest.slug}`, dedupe: true });
       changed.judging++;
@@ -49,5 +53,7 @@ export async function GET(request) {
   } catch (error) {
     console.error('[contest cron] failed:', error?.message || error);
     return NextResponse.json({ error: 'Contest transitions failed' }, { status: 500 });
+  } finally {
+    if (sitemapTouched) await invalidateSitemapCache();
   }
 }

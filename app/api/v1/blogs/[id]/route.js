@@ -12,6 +12,7 @@ import {
   slugify,
 } from '../../../../../lib/api/v1/blogInput';
 import { invalidateBlogLifecycleCaches } from '../../../../../lib/api/v1/blogCache';
+import { getIndexableBlogUrl, notifyBlogDiscoveryChange } from '../../../../../lib/blogDiscovery';
 import { blogEntityTag } from '../../../../../lib/api/v1/entityTag';
 import { recordApiAudit } from '../../../../../lib/api/v1/operations';
 import { checkIfMatch } from '../../../../../lib/api/v1/preconditions';
@@ -24,7 +25,6 @@ import { canEditBlog } from '../../../../../lib/permissions';
 import { readTimeFromWords } from '../../../../../lib/readTime';
 import { credentialAllowsPublishedAs } from '../../../../../lib/api/v1/personalAccessTokens';
 import { contentDiscoveryMetadata } from '../../../../../lib/recommendations';
-import { notifySearchDiscovery } from '../../../../../lib/searchDiscovery';
 
 const READ_SCOPE = 'lixblogs:blog:read';
 
@@ -157,6 +157,7 @@ export async function PATCH(request, { params }) {
       : current.slug;
     const now = Math.floor(Date.now() / 1000);
     const secret = current.status === 'draft' && input.secret !== undefined ? input.secret : Boolean(current.secret);
+    const beforeUrl = await getIndexableBlogUrl(db, id);
     const profile = await db.prepare('SELECT locale FROM users WHERE id = ?').bind(current.author_id).first();
     const discovery = contentDiscoveryMetadata({
       language: input.language ?? current.language,
@@ -182,11 +183,16 @@ export async function PATCH(request, { params }) {
       (input.allowComments ?? Boolean(current.allow_comments)) ? 1 : 0,
       readTimeFromWords(countBlockWords(content)), now, id,
     ).run();
-    if (input.tags !== undefined) {
-      await db.prepare('DELETE FROM blog_tags WHERE blog_id = ?').bind(id).run();
-      for (const tag of input.tags) {
-        await db.prepare('INSERT OR IGNORE INTO blog_tags (blog_id, tag) VALUES (?, ?)').bind(id, tag).run();
+    try {
+      if (input.tags !== undefined) {
+        await db.prepare('DELETE FROM blog_tags WHERE blog_id = ?').bind(id).run();
+        for (const tag of input.tags) {
+          await db.prepare('INSERT OR IGNORE INTO blog_tags (blog_id, tag) VALUES (?, ?)').bind(id, tag).run();
+        }
       }
+    } finally {
+      if (current.status !== 'draft') await invalidateBlogLifecycleCaches(id);
+      notifyBlogDiscoveryChange(beforeUrl, await getIndexableBlogUrl(db, id));
     }
     const updated = await db.prepare('SELECT * FROM blogs WHERE id = ?').bind(id).first();
     const etag = await blogEntityTag(updated);
@@ -197,10 +203,6 @@ export async function PATCH(request, { params }) {
           label: 'cli-edit', userId: auth.userId, throttleSeconds: 300,
         });
       } catch {}
-    }
-    if (updated.status !== 'draft') await invalidateBlogLifecycleCaches(id);
-    if (updated.status === 'published') {
-      notifySearchDiscovery(`https://blogs.elixpo.com${await getBlogCanonicalPath(db, id)}`);
     }
     await recordApiAudit(db, {
       requestId: context.requestId, userId: auth.userId, clientId: auth.clientId,
@@ -239,9 +241,7 @@ export async function DELETE(request, { params }) {
         details: { currentEtag: precondition.current }, headers: { ...rateHeaders, ETag: precondition.current },
       });
     }
-    const publicUrl = blog.status === 'published'
-      ? `https://blogs.elixpo.com${await getBlogCanonicalPath(db, id)}`
-      : null;
+    const beforeUrl = await getIndexableBlogUrl(db, id);
     if (permanent) {
       if (request.headers.get('x-confirm-permanent-delete') !== id) {
         return apiError(context, 'confirmation_required', 'Permanent deletion requires X-Confirm-Permanent-Delete with the blog ID.', 400, { headers: rateHeaders });
@@ -272,7 +272,7 @@ export async function DELETE(request, { params }) {
       `).bind(now, now, id).run();
     }
     await invalidateBlogLifecycleCaches(id);
-    if (publicUrl) notifySearchDiscovery(publicUrl);
+    notifyBlogDiscoveryChange(beforeUrl, null);
     await recordApiAudit(db, {
       requestId: context.requestId, userId: auth.userId, clientId: auth.clientId,
       action: permanent ? 'blogs.delete.permanent' : 'blogs.delete', resourceType: 'blog', resourceId: id,

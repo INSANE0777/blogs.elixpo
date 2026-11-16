@@ -6,6 +6,7 @@ import { NextResponse } from 'next/server';
 import { getSession } from '../../../../lib/auth';
 import { requestTooLarge, byteLength, MAX_BLOG_CONTENT_BYTES } from '../../../../lib/limits';
 import { contentDiscoveryMetadata } from '../../../../lib/recommendations';
+import { getIndexableBlogUrl, notifyBlogDiscoveryChange } from '../../../../lib/blogDiscovery';
 
 // Never let any editor-data response be cached — a signed-out 401 (or one
 // user's data) must not be replayed to another state/user from cache.
@@ -167,6 +168,7 @@ export async function POST(request) {
 
     // Check if blog exists
     const existing = await db.prepare('SELECT id, author_id, status, secret, member_only, language, region, published_as FROM blogs WHERE id = ?').bind(slugid).first();
+    const beforeUrl = existing ? await getIndexableBlogUrl(db, slugid) : null;
     const profile = await db.prepare('SELECT locale FROM users WHERE id = ?').bind(existing?.author_id || session.userId).first();
     const discovery = contentDiscoveryMetadata({
       language: language ?? existing?.language,
@@ -256,33 +258,37 @@ export async function POST(request) {
     }
 
     // Media can be uploaded before a brand-new draft row exists. Associate
-    // those staged assets now that the blog satisfies the foreign key.
-    await db.prepare(`
-      UPDATE media_uploads SET blog_id = ?
-      WHERE blog_id IS NULL AND user_id = ? AND cloudinary_public_id LIKE ?
-    `).bind(slugid, session.userId, `lixblogs/${slugid}/%`).run();
+    // those staged assets now that the blog satisfies the foreign key. An
+    // autosave can also edit an already-published post, so the sitemap snapshot
+    // is invalidated only after the final tag rewrite — a later failure must
+    // still refresh a row whose update already committed.
+    const invalidatePublishedRow = existing?.status === 'published';
     try {
-      const { kvInvalidate, mediaInventoryCacheKey } = await import('../../../../lib/cache');
-      await kvInvalidate(mediaInventoryCacheKey(session.userId));
-    } catch {}
-
-    // Autosave can edit an already-published post. Its title, tags, slug-adjacent
-    // metadata, and updated timestamp must reach the sitemap without waiting for
-    // the cache TTL. New drafts do not belong in public discovery.
-    if (existing && existing.status === 'published') {
+      await db.prepare(`
+        UPDATE media_uploads SET blog_id = ?
+        WHERE blog_id IS NULL AND user_id = ? AND cloudinary_public_id LIKE ?
+      `).bind(slugid, session.userId, `lixblogs/${slugid}/%`).run();
       try {
-        const { invalidateBlogLifecycleCaches } = await import('../../../../lib/api/v1/blogCache');
-        await invalidateBlogLifecycleCaches(slugid);
+        const { kvInvalidate, mediaInventoryCacheKey } = await import('../../../../lib/cache');
+        await kvInvalidate(mediaInventoryCacheKey(session.userId));
       } catch {}
-    }
 
-    // Sync tags
-    if (Array.isArray(tags)) {
-      const normalizedTags = normalizeTags(tags);
-      await db.prepare('DELETE FROM blog_tags WHERE blog_id = ?').bind(slugid).run();
-      for (const tag of normalizedTags) {
-        await db.prepare('INSERT OR IGNORE INTO blog_tags (blog_id, tag) VALUES (?, ?)')
-          .bind(slugid, tag).run();
+      // Sync tags
+      if (Array.isArray(tags)) {
+        const normalizedTags = normalizeTags(tags);
+        await db.prepare('DELETE FROM blog_tags WHERE blog_id = ?').bind(slugid).run();
+        for (const tag of normalizedTags) {
+          await db.prepare('INSERT OR IGNORE INTO blog_tags (blog_id, tag) VALUES (?, ?)')
+            .bind(slugid, tag).run();
+        }
+      }
+    } finally {
+      if (invalidatePublishedRow) {
+        try {
+          const { invalidateBlogLifecycleCaches } = await import('../../../../lib/api/v1/blogCache');
+          await invalidateBlogLifecycleCaches(slugid);
+        } catch {}
+        notifyBlogDiscoveryChange(beforeUrl, await getIndexableBlogUrl(db, slugid));
       }
     }
 

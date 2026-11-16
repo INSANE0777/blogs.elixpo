@@ -2,6 +2,7 @@ export const runtime = 'edge';
 
 import { NextResponse } from 'next/server';
 import { getSession } from '../../../../../../lib/auth';
+import { invalidateSitemapCache } from '../../../../../../lib/cache';
 import {
   CURATED_ENTRY_SELECT,
   getOwnedCollection,
@@ -73,23 +74,29 @@ export async function POST(request, { params }) {
       SELECT COALESCE(MAX(position), -1) AS position
       FROM curated_collection_entries WHERE collection_id = ?
     `).bind(id).first();
-    await db.prepare(`
-      INSERT INTO curated_collection_entries
-        (collection_id, blog_id, added_by, position, curator_note, category, added_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, unixepoch(), unixepoch())
-      ON CONFLICT(collection_id, blog_id) DO UPDATE SET
-        curator_note = excluded.curator_note,
-        category = excluded.category,
-        updated_at = unixepoch()
-    `).bind(
-      id,
-      blog.id,
-      session.userId,
-      Number(last?.position ?? -1) + 1,
-      cleanText(body.curatorNote, 500),
-      cleanText(body.category, 80),
-    ).run();
-    await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
+    let touched = false;
+    try {
+      await db.prepare(`
+        INSERT INTO curated_collection_entries
+          (collection_id, blog_id, added_by, position, curator_note, category, added_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, unixepoch(), unixepoch())
+        ON CONFLICT(collection_id, blog_id) DO UPDATE SET
+          curator_note = excluded.curator_note,
+          category = excluded.category,
+          updated_at = unixepoch()
+      `).bind(
+        id,
+        blog.id,
+        session.userId,
+        Number(last?.position ?? -1) + 1,
+        cleanText(body.curatorNote, 500),
+        cleanText(body.category, 80),
+      ).run();
+      touched = true;
+      await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
+    } finally {
+      if (touched) await invalidateSitemapCache();
+    }
     if (blog.author_id !== session.userId && collection.visibility !== 'private') {
       const { notify } = await import('../../../../../../lib/notify');
       await notify(db, {
@@ -122,24 +129,32 @@ export async function PATCH(request, { params }) {
     const collection = await getOwnedCollection(db, id, session.userId);
     if (!collection) return NextResponse.json({ error: 'Collection not found' }, { status: 404 });
 
-    if (Array.isArray(body.order)) {
-      const unique = [...new Set(body.order.filter(value => typeof value === 'string'))];
-      if (unique.length > 500) return NextResponse.json({ error: 'A collection supports at most 500 entries' }, { status: 400 });
-      const statements = unique.map((blogId, index) => db.prepare(`
-        UPDATE curated_collection_entries SET position = ?, updated_at = unixepoch()
-        WHERE collection_id = ? AND blog_id = ?
-      `).bind(index, id, blogId));
-      if (statements.length) await db.batch(statements);
-    } else if (body.blogId) {
-      await db.prepare(`
-        UPDATE curated_collection_entries
-        SET curator_note = ?, category = ?, updated_at = unixepoch()
-        WHERE collection_id = ? AND blog_id = ?
-      `).bind(cleanText(body.curatorNote, 500), cleanText(body.category, 80), id, body.blogId).run();
-    } else {
-      return NextResponse.json({ error: 'Provide order or blogId' }, { status: 400 });
+    let touched = false;
+    try {
+      if (Array.isArray(body.order)) {
+        const unique = [...new Set(body.order.filter(value => typeof value === 'string'))];
+        if (unique.length > 500) return NextResponse.json({ error: 'A collection supports at most 500 entries' }, { status: 400 });
+        const statements = unique.map((blogId, index) => db.prepare(`
+          UPDATE curated_collection_entries SET position = ?, updated_at = unixepoch()
+          WHERE collection_id = ? AND blog_id = ?
+        `).bind(index, id, blogId));
+        if (statements.length) await db.batch(statements);
+        touched = statements.length > 0;
+      } else if (body.blogId) {
+        const result = await db.prepare(`
+          UPDATE curated_collection_entries
+          SET curator_note = ?, category = ?, updated_at = unixepoch()
+          WHERE collection_id = ? AND blog_id = ?
+        `).bind(cleanText(body.curatorNote, 500), cleanText(body.category, 80), id, body.blogId).run();
+        touched = Boolean(result?.meta?.changes);
+      } else {
+        return NextResponse.json({ error: 'Provide order or blogId' }, { status: 400 });
+      }
+      await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
+      touched = true;
+    } finally {
+      if (touched) await invalidateSitemapCache();
     }
-    await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
     return NextResponse.json({ ok: true });
   } catch (error) {
     console.error('[curated-collections] update entries failed:', error?.message || error);
@@ -157,7 +172,7 @@ export async function DELETE(request, { params }) {
   try {
     const db = await dbConnection();
     const collection = await db.prepare('SELECT user_id FROM bookmark_collections WHERE id = ?').bind(id).first();
-    const blog = await db.prepare('SELECT author_id FROM blogs WHERE id = ? OR slugid = ? LIMIT 1').bind(blogId, blogId).first();
+    const blog = await db.prepare('SELECT id, author_id FROM blogs WHERE id = ? OR slugid = ? LIMIT 1').bind(blogId, blogId).first();
     if (!collection || !blog) return NextResponse.json({ error: 'Entry not found' }, { status: 404 });
     if (collection.user_id !== session.userId && blog.author_id !== session.userId) {
       return NextResponse.json({ error: 'Not authorized' }, { status: 403 });
@@ -166,7 +181,11 @@ export async function DELETE(request, { params }) {
       DELETE FROM curated_collection_entries WHERE collection_id = ? AND blog_id = ?
     `).bind(id, blog.id).run();
     if (!result?.meta?.changes) return NextResponse.json({ error: 'Entry not found' }, { status: 404 });
-    await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
+    try {
+      await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
+    } finally {
+      await invalidateSitemapCache();
+    }
     return NextResponse.json({ ok: true });
   } catch (error) {
     console.error('[curated-collections] remove entry failed:', error?.message || error);

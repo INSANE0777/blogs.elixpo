@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic';
 import { authorizeApiRequest } from '../../../../../../lib/api/v1/authorize';
 import { recordApiAudit } from '../../../../../../lib/api/v1/operations';
 import { apiError, apiSuccess, requestContext } from '../../../../../../lib/api/v1/responses';
+import { invalidateSitemapCache } from '../../../../../../lib/cache';
 import {
   CURATED_ENTRY_SELECT,
   getOwnedCollection,
@@ -50,18 +51,24 @@ export async function POST(request, { params }) {
     if (!blog || blog.status !== 'published' || blog.secret || blog.deleted_at) return apiError(context, 'blog_not_found', 'An accessible public blog was not found.', 404, { headers: rateHeaders });
     if (!blog.allow_public_curation && blog.author_id !== auth.userId) return apiError(context, 'curation_forbidden', 'The author does not allow third-party curation.', 403, { headers: rateHeaders });
     const last = await db.prepare('SELECT COALESCE(MAX(position), -1) AS position FROM curated_collection_entries WHERE collection_id = ?').bind(id).first();
-    await db.prepare(`
-      INSERT INTO curated_collection_entries
-        (collection_id, blog_id, added_by, position, curator_note, category, added_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, unixepoch(), unixepoch())
-      ON CONFLICT(collection_id, blog_id) DO UPDATE SET
-        curator_note = excluded.curator_note, category = excluded.category, updated_at = unixepoch()
-    `).bind(
-      id, blog.id, auth.userId, Number(last?.position ?? -1) + 1,
-      String(input.curatorNote || '').trim().slice(0, 500),
-      String(input.category || '').trim().slice(0, 80),
-    ).run();
-    await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
+    let touched = false;
+    try {
+      await db.prepare(`
+        INSERT INTO curated_collection_entries
+          (collection_id, blog_id, added_by, position, curator_note, category, added_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, unixepoch(), unixepoch())
+        ON CONFLICT(collection_id, blog_id) DO UPDATE SET
+          curator_note = excluded.curator_note, category = excluded.category, updated_at = unixepoch()
+      `).bind(
+        id, blog.id, auth.userId, Number(last?.position ?? -1) + 1,
+        String(input.curatorNote || '').trim().slice(0, 500),
+        String(input.category || '').trim().slice(0, 80),
+      ).run();
+      touched = true;
+      await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
+    } finally {
+      if (touched) await invalidateSitemapCache();
+    }
     if (blog.author_id !== auth.userId && collection.visibility !== 'private') {
       const [actor, { notify }] = await Promise.all([
         db.prepare('SELECT username, display_name, avatar_url FROM users WHERE id = ?').bind(auth.userId).first(),
@@ -98,7 +105,11 @@ export async function DELETE(request, { params }) {
     if (!collection) return apiError(context, 'collection_not_found', 'The collection was not found.', 404, { headers: rateHeaders });
     const result = await db.prepare('DELETE FROM curated_collection_entries WHERE collection_id = ? AND blog_id = ?').bind(id, blogId).run();
     if (!result?.meta?.changes) return apiError(context, 'entry_not_found', 'The collection entry was not found.', 404, { headers: rateHeaders });
-    await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
+    try {
+      await db.prepare('UPDATE bookmark_collections SET updated_at = unixepoch() WHERE id = ?').bind(id).run();
+    } finally {
+      await invalidateSitemapCache();
+    }
     await recordApiAudit(db, { requestId: context.requestId, userId: auth.userId, clientId: auth.clientId, action: 'collections.entries.remove', resourceType: 'collection', resourceId: id, metadata: { blogId } });
     return apiSuccess(context, { removed: true, collectionId: id, blogId }, { headers: rateHeaders });
   } catch {

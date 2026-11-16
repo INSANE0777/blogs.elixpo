@@ -1,5 +1,6 @@
 export const runtime = 'edge';
 import { NextResponse } from 'next/server';
+import { getIndexableBlogUrl, notifyBlogDiscoveryChange } from '../../../../lib/blogDiscovery';
 
 // Admin moderation endpoint, called by the GitHub moderation workflow.
 // Auth: shared secret in the `x-moderation-secret` header (fail closed).
@@ -31,13 +32,9 @@ export async function POST(request) {
        FROM blogs b JOIN users u ON u.id = b.author_id WHERE b.id = ?`
     ).bind(blogId).first();
     if (!blog) return NextResponse.json({ error: 'Blog not found' }, { status: 404 });
-    let publicUrl = null;
-    if (blog.status === 'published' || blog.status === 'under_review') {
-      const { getBlogCanonicalPath } = await import('../../../../lib/blogUrl');
-      publicUrl = `https://blogs.elixpo.com${await getBlogCanonicalPath(db, blogId)}`;
-    }
 
     if (action === 'dismiss') {
+      const beforeUrl = await getIndexableBlogUrl(db, blogId);
       await db.batch([
         db.prepare("UPDATE blogs SET status = 'published', updated_at = unixepoch() WHERE id = ? AND status = 'under_review'").bind(blogId),
         db.prepare("UPDATE reports SET status = 'dismissed' WHERE blog_id = ?").bind(blogId),
@@ -47,13 +44,15 @@ export async function POST(request) {
           const { invalidateBlogLifecycleCaches } = await import('../../../../lib/api/v1/blogCache');
           await invalidateBlogLifecycleCaches(blogId);
         } catch {}
-        const { notifySearchDiscovery } = await import('../../../../lib/searchDiscovery');
-        notifySearchDiscovery(publicUrl);
+        notifyBlogDiscoveryChange(beforeUrl, await getIndexableBlogUrl(db, blogId));
       }
       return NextResponse.json({ ok: true, action: 'dismiss', restored: blog.status === 'under_review' });
     }
 
     // ── takedown: hard delete ──
+    // Capture the formerly public URL before the rows vanish; a private-org or
+    // secret post never had one.
+    const beforeUrl = await getIndexableBlogUrl(db, blogId);
     // Best-effort Cloudinary cleanup before the rows vanish.
     let mediaOwners = [];
     try {
@@ -90,10 +89,7 @@ export async function POST(request) {
       const { invalidateBlogLifecycleCaches } = await import('../../../../lib/api/v1/blogCache');
       await invalidateBlogLifecycleCaches(blogId);
     } catch {}
-    if (publicUrl) {
-      const { notifySearchDiscovery } = await import('../../../../lib/searchDiscovery');
-      notifySearchDiscovery(publicUrl);
-    }
+    if (beforeUrl) notifyBlogDiscoveryChange(beforeUrl, null);
 
     // Notify the author by email (best-effort).
     if (blog.author_email) {

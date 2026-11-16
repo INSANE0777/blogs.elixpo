@@ -1,6 +1,7 @@
 export const runtime = 'edge';
 import { NextResponse } from 'next/server';
 import { getSession } from '../../../../../lib/auth';
+import { invalidateSitemapCache } from '../../../../../lib/cache';
 import {
   COLLECTION_VISIBILITIES,
   getOwnedCollection,
@@ -36,7 +37,7 @@ export async function PUT(request, { params }) {
     const { getDB } = await import('../../../../../lib/cloudflare');
     const db = getDB();
 
-    await db.prepare(`
+    const result = await db.prepare(`
       UPDATE bookmark_collections SET
         name = COALESCE(?, name), description = COALESCE(?, description),
         introduction = COALESCE(?, introduction), cover_url = COALESCE(?, cover_url),
@@ -55,6 +56,7 @@ export async function PUT(request, { params }) {
       id,
       session.userId,
     ).run();
+    if (result?.meta?.changes) await invalidateSitemapCache();
 
     return NextResponse.json({ ok: true });
   } catch {
@@ -72,7 +74,8 @@ export async function DELETE(request, { params }) {
     const { getDB } = await import('../../../../../lib/cloudflare');
     const db = getDB();
 
-    await db.prepare('DELETE FROM bookmark_collections WHERE id = ? AND user_id = ?').bind(id, session.userId).run();
+    const result = await db.prepare('DELETE FROM bookmark_collections WHERE id = ? AND user_id = ?').bind(id, session.userId).run();
+    if (result?.meta?.changes) await invalidateSitemapCache();
     return NextResponse.json({ ok: true });
   } catch {
     return NextResponse.json({ error: 'Failed' }, { status: 500 });

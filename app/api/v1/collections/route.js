@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic';
 import { authorizeApiRequest } from '../../../../lib/api/v1/authorize';
 import { recordApiAudit } from '../../../../lib/api/v1/operations';
 import { apiError, apiSuccess, requestContext } from '../../../../lib/api/v1/responses';
+import { invalidateSitemapCache } from '../../../../lib/cache';
 import {
   COLLECTION_VISIBILITIES,
   collectionSlug,
@@ -63,6 +64,7 @@ export async function POST(request) {
       String(input.introduction || '').trim().slice(0, 5000), coverUrl,
       slug, visibility === 'public' ? 1 : 0, visibility,
     ).run();
+    await invalidateSitemapCache();
     await recordApiAudit(db, { requestId: context.requestId, userId: auth.userId, clientId: auth.clientId, action: 'collections.create', resourceType: 'collection', resourceId: id });
     return apiSuccess(context, { id, name, slug, visibility, count: 0 }, { status: 201, headers: rateHeaders });
   } catch (error) {

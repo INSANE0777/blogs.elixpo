@@ -1,6 +1,12 @@
 export const runtime = 'edge';
 import { NextResponse } from 'next/server';
 import { getSession } from '../../../../lib/auth';
+import {
+  getCollectionBlogIds,
+  getIndexableBlogUrlsForBlogIds,
+  notifyBlogDiscoveryChange,
+} from '../../../../lib/blogDiscovery';
+import { invalidateSitemapCache } from '../../../../lib/cache';
 
 // List collections for an org
 export async function GET(request) {
@@ -77,6 +83,7 @@ export async function POST(request) {
       INSERT INTO collections (id, org_id, slug, name, description, created_by, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(colId, orgId, cleanSlug, name.trim(), description || '', session.userId, now, now).run();
+    await invalidateSitemapCache();
 
     return NextResponse.json({ ok: true, id: colId, slug: cleanSlug });
   } catch (e) {
@@ -128,6 +135,8 @@ export async function PUT(request) {
     }
 
     const now = Math.floor(Date.now() / 1000);
+    const beforeIds = await getCollectionBlogIds(db, collectionId);
+    const beforeUrls = await getIndexableBlogUrlsForBlogIds(db, beforeIds);
     try {
       await db.prepare('UPDATE collections SET name = COALESCE(?, name), description = COALESCE(?, description), slug = COALESCE(?, slug), updated_at = ? WHERE id = ?')
         .bind(name || null, description || null, cleanSlug, now, collectionId).run();
@@ -137,6 +146,9 @@ export async function PUT(request) {
       }
       throw e;
     }
+    await invalidateSitemapCache();
+    const afterUrls = await getIndexableBlogUrlsForBlogIds(db, beforeIds);
+    notifyBlogDiscoveryChange(beforeUrls, afterUrls);
 
     return NextResponse.json({ ok: true, slug: cleanSlug || col.slug });
   } catch {
@@ -168,10 +180,22 @@ export async function DELETE(request) {
     }
 
     // Unset collection_id on blogs in this collection
-    await db.prepare('UPDATE blogs SET collection_id = NULL WHERE collection_id = ?').bind(collectionId).run();
-    await db.prepare('DELETE FROM collections WHERE id = ?').bind(collectionId).run();
+    const beforeIds = await getCollectionBlogIds(db, collectionId);
+    const beforeUrls = await getIndexableBlogUrlsForBlogIds(db, beforeIds);
+    let touched = false;
+    try {
+      await db.prepare('UPDATE blogs SET collection_id = NULL WHERE collection_id = ?').bind(collectionId).run();
+      touched = true;
+      await db.prepare('DELETE FROM collections WHERE id = ?').bind(collectionId).run();
 
-    return NextResponse.json({ ok: true });
+      return NextResponse.json({ ok: true });
+    } finally {
+      await invalidateSitemapCache();
+      if (touched) {
+        // The blogs survive but their canonical paths fall back to the org.
+        notifyBlogDiscoveryChange(beforeUrls, await getIndexableBlogUrlsForBlogIds(db, beforeIds));
+      }
+    }
   } catch {
     return NextResponse.json({ error: 'Failed to delete' }, { status: 500 });
   }

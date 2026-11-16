@@ -3,6 +3,12 @@ import { NextResponse } from 'next/server';
 import { getSession } from '../../../lib/auth';
 import { getLimits } from '../../../lib/tiers';
 import { normalizeOrgVisibility } from '../../../lib/orgVisibility';
+import {
+  getIndexableBlogUrlsForBlogIds,
+  getOrgBlogIds,
+  notifyBlogDiscoveryChange,
+} from '../../../lib/blogDiscovery';
+import { invalidateSitemapCache } from '../../../lib/cache';
 
 // List user's orgs
 export async function GET() {
@@ -100,6 +106,7 @@ export async function POST(request) {
       INSERT INTO orgs (id, slug, name, tagline, description, bio, website, visibility, owner_id, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(orgId, cleanSlug, name.trim(), cleanTagline, description || '', bio || '', normWebsite || '', normalizedVisibility, session.userId, now, now).run();
+    await invalidateSitemapCache();
 
     // Owner is also a member with admin role
     await db.prepare(`
@@ -171,42 +178,60 @@ export async function PUT(request) {
       return NextResponse.json({ error: 'Not authorized' }, { status: 403 });
     }
 
+    // Capture the article URLs this org exposes before any write. Post-write
+    // URLs are recomputed from committed rows, so visibility flips, renames and
+    // deletes keep exact old/new notification pairs without reconstructing them
+    // from already-mutated org/collection data.
+    const beforeIds = await getOrgBlogIds(db, orgId);
+    const beforeUrls = await getIndexableBlogUrlsForBlogIds(db, beforeIds);
+    let sitemapTouched = false;
+
     // Handle a slug (handle) change — owner/admin only, validated + uniquely
     // reserved in the namespace, releasing the old one. Returned so the client
     // can update the URL bar.
     let finalSlug = null;
-    if (typeof slug === 'string' && slug.trim()) {
-      const { validateSlug } = await import('../../../lib/slugify');
-      const cur = await db.prepare('SELECT slug FROM orgs WHERE id = ?').bind(orgId).first();
-      const check = validateSlug(slug, { label: 'Org handle' });
-      if (!check.ok) return NextResponse.json({ error: check.error }, { status: 400 });
-      if (cur && check.slug !== cur.slug) {
-        const { reserveName, releaseName } = await import('../../../lib/namespace');
-        const res = await reserveName(db, check.slug, 'org', orgId);
-        if (!res.success) return NextResponse.json({ error: res.error || 'That handle is already taken' }, { status: 409 });
-        await releaseName(db, cur.slug);
-        await db.prepare('UPDATE orgs SET slug = ? WHERE id = ?').bind(check.slug, orgId).run();
-        finalSlug = check.slug;
+    try {
+      if (typeof slug === 'string' && slug.trim()) {
+        const { validateSlug } = await import('../../../lib/slugify');
+        const cur = await db.prepare('SELECT slug FROM orgs WHERE id = ?').bind(orgId).first();
+        const check = validateSlug(slug, { label: 'Org handle' });
+        if (!check.ok) return NextResponse.json({ error: check.error }, { status: 400 });
+        if (cur && check.slug !== cur.slug) {
+          const { reserveName, releaseName } = await import('../../../lib/namespace');
+          const res = await reserveName(db, check.slug, 'org', orgId);
+          if (!res.success) return NextResponse.json({ error: res.error || 'That handle is already taken' }, { status: 409 });
+          await releaseName(db, cur.slug);
+          await db.prepare('UPDATE orgs SET slug = ? WHERE id = ?').bind(check.slug, orgId).run();
+          sitemapTouched = true;
+          finalSlug = check.slug;
+        }
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      await db.prepare(`
+        UPDATE orgs SET name = COALESCE(?, name), tagline = COALESCE(?, tagline), description = COALESCE(?, description),
+          bio = COALESCE(?, bio), website = COALESCE(?, website),
+          links = COALESCE(?, links), visibility = COALESCE(?, visibility),
+          featured_blog_ids = COALESCE(?, featured_blog_ids),
+          timezone = COALESCE(?, timezone), location = COALESCE(?, location),
+          contact_email = COALESCE(?, contact_email), updated_at = ?
+        WHERE id = ?
+      `).bind(
+        name || null, cleanTagline ?? null, description || null, bio || null, normWebsite ?? null,
+        normLinks ? JSON.stringify(normLinks) : null, finalVisibility,
+        featured_blog_ids ? JSON.stringify(featured_blog_ids) : null,
+        timezone || null, location || null, contact_email || null, now, orgId
+      ).run();
+      sitemapTouched = true;
+
+      return NextResponse.json({ ok: true, slug: finalSlug });
+    } finally {
+      if (sitemapTouched) {
+        await invalidateSitemapCache();
+        const afterUrls = await getIndexableBlogUrlsForBlogIds(db, await getOrgBlogIds(db, orgId));
+        notifyBlogDiscoveryChange(beforeUrls, afterUrls);
       }
     }
-
-    const now = Math.floor(Date.now() / 1000);
-    await db.prepare(`
-      UPDATE orgs SET name = COALESCE(?, name), tagline = COALESCE(?, tagline), description = COALESCE(?, description),
-        bio = COALESCE(?, bio), website = COALESCE(?, website),
-        links = COALESCE(?, links), visibility = COALESCE(?, visibility),
-        featured_blog_ids = COALESCE(?, featured_blog_ids),
-        timezone = COALESCE(?, timezone), location = COALESCE(?, location),
-        contact_email = COALESCE(?, contact_email), updated_at = ?
-      WHERE id = ?
-    `).bind(
-      name || null, cleanTagline ?? null, description || null, bio || null, normWebsite ?? null,
-      normLinks ? JSON.stringify(normLinks) : null, finalVisibility,
-      featured_blog_ids ? JSON.stringify(featured_blog_ids) : null,
-      timezone || null, location || null, contact_email || null, now, orgId
-    ).run();
-
-    return NextResponse.json({ ok: true, slug: finalSlug });
   } catch (e) {
     console.error('Update org error:', e);
     return NextResponse.json({ error: 'Failed to update' }, { status: 500 });
@@ -232,15 +257,28 @@ export async function DELETE(request) {
       return NextResponse.json({ error: 'Only the owner can delete an organization' }, { status: 403 });
     }
 
-    // Cascade: members, invites, collections, namespace
-    const { releaseName } = await import('../../../lib/namespace');
-    await db.prepare('DELETE FROM org_members WHERE org_id = ?').bind(orgId).run();
-    await db.prepare('DELETE FROM org_invites WHERE org_id = ?').bind(orgId).run();
-    await db.prepare('DELETE FROM collections WHERE org_id = ?').bind(orgId).run();
-    await db.prepare('DELETE FROM orgs WHERE id = ?').bind(orgId).run();
-    if (org.slug) await releaseName(db, org.slug);
+    const beforeIds = await getOrgBlogIds(db, orgId);
+    const beforeUrls = await getIndexableBlogUrlsForBlogIds(db, beforeIds);
+    let sitemapTouched = false;
 
-    return NextResponse.json({ ok: true });
+    try {
+      // Cascade: members, invites, collections, namespace
+      const { releaseName } = await import('../../../lib/namespace');
+      await db.prepare('DELETE FROM org_members WHERE org_id = ?').bind(orgId).run();
+      await db.prepare('DELETE FROM org_invites WHERE org_id = ?').bind(orgId).run();
+      await db.prepare('DELETE FROM collections WHERE org_id = ?').bind(orgId).run();
+      sitemapTouched = true;
+      await db.prepare('DELETE FROM orgs WHERE id = ?').bind(orgId).run();
+      if (org.slug) await releaseName(db, org.slug);
+
+      return NextResponse.json({ ok: true });
+    } finally {
+      await invalidateSitemapCache();
+      // A partial delete may remove collections while the org still exists.
+      if (sitemapTouched) {
+        notifyBlogDiscoveryChange(beforeUrls, await getIndexableBlogUrlsForBlogIds(db, beforeIds));
+      }
+    }
   } catch (e) {
     console.error('Delete org error:', e);
     return NextResponse.json({ error: 'Failed to delete' }, { status: 500 });

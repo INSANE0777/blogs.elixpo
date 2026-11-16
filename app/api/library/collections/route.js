@@ -1,6 +1,7 @@
 export const runtime = 'edge';
 import { NextResponse } from 'next/server';
 import { getSession } from '../../../../lib/auth';
+import { invalidateSitemapCache } from '../../../../lib/cache';
 import {
   COLLECTION_VISIBILITIES,
   collectionSlug,
@@ -66,6 +67,7 @@ export async function POST(request) {
       (introduction || '').trim().slice(0, 5000), cleanCoverUrl, slug,
       visibility === 'public' ? 1 : 0, visibility,
     ).run();
+    await invalidateSitemapCache();
     return NextResponse.json({
       ok: true,
       collection: { id, name: name.trim(), slug, description: (description || '').trim(), introduction: (introduction || '').trim(), coverUrl: cleanCoverUrl, visibility, count: 0 },
@@ -114,8 +116,9 @@ export async function PATCH(request) {
     }
     if (!sets.length) return NextResponse.json({ ok: true });
     sets.push('updated_at = unixepoch()');
-    await db.prepare(`UPDATE bookmark_collections SET ${sets.join(', ')} WHERE id = ? AND user_id = ?`)
+    const result = await db.prepare(`UPDATE bookmark_collections SET ${sets.join(', ')} WHERE id = ? AND user_id = ?`)
       .bind(...binds, id, session.userId).run();
+    if (result?.meta?.changes) await invalidateSitemapCache();
     return NextResponse.json({ ok: true });
   } catch {
     return NextResponse.json({ error: 'Failed' }, { status: 500 });
@@ -135,6 +138,7 @@ export async function DELETE(request) {
       db.prepare('UPDATE bookmarks SET collection_id = NULL WHERE collection_id = ? AND user_id = ?').bind(id, session.userId),
       db.prepare('DELETE FROM bookmark_collections WHERE id = ? AND user_id = ?').bind(id, session.userId),
     ]);
+    await invalidateSitemapCache();
     return NextResponse.json({ ok: true });
   } catch {
     return NextResponse.json({ error: 'Failed' }, { status: 500 });
